@@ -44,5 +44,8 @@
     "ios": "expo start --ios",
     "web": "expo start --web"
   },
-  "private": true
+  "private": true,
+  "overrides": {
+    "react-native-worklets": "0.10.0"
+  }
 }
