@@ -1,4 +1,6 @@
-from fastapi import APIRouter, HTTPException, Depends
+import time
+import threading
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from app.schemas.schemas import CreateEventRequest
 from app.db.database import get_supabase_admin
 from app.middleware.auth import get_current_user, require_coach
@@ -7,9 +9,33 @@ router = APIRouter(prefix="/events", tags=["events"])
 
 VALID_TEST_TYPES = ["20m_sprint", "30m_sprint", "agility"]
 
+COACH_MAP_CACHE = {}
+LAST_CACHE_TIME = 0
+CACHE_TTL = 300  # Cache for 5 minutes
+CACHE_LOCK = threading.Lock()
+
+def refresh_coach_cache():
+    global COACH_MAP_CACHE, LAST_CACHE_TIME
+    # Try to acquire lock without blocking to avoid queueing duplicate requests
+    if not CACHE_LOCK.acquire(blocking=False):
+        return
+    try:
+        # Double-check inside lock
+        if time.time() - LAST_CACHE_TIME < CACHE_TTL:
+            return
+        db = get_supabase_admin()
+        auth_users = db.auth.admin.list_users()
+        new_map = {u.id: (u.user_metadata.get("full_name") if u.user_metadata else "Unknown") for u in auth_users}
+        COACH_MAP_CACHE = new_map
+        LAST_CACHE_TIME = time.time()
+    except Exception as e:
+        print("Failed to refresh coach cache in background:", e)
+    finally:
+        CACHE_LOCK.release()
+
 
 @router.get("")
-async def list_events(user: dict = Depends(get_current_user)):
+async def list_events(background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     """List all test events."""
     db = get_supabase_admin()
     try:
@@ -19,16 +45,22 @@ async def list_events(user: dict = Depends(get_current_user)):
             query = query.eq("created_by", user["id"])
         result = query.execute()
         events = result.data or []
-        
-        # Attach coach names
-        auth_users = db.auth.admin.list_users()
-        coach_map = {u.id: (u.user_metadata.get("full_name") if u.user_metadata else "Unknown") for u in auth_users}
+
+        global COACH_MAP_CACHE, LAST_CACHE_TIME
+        if not COACH_MAP_CACHE:
+            # Cache is cold — do a synchronous fetch on first call
+            refresh_coach_cache()
+        elif time.time() - LAST_CACHE_TIME > CACHE_TTL:
+            # Cache is stale — refresh in background, serve stale data now
+            background_tasks.add_task(refresh_coach_cache)
+
         for e in events:
-            e["coach_name"] = coach_map.get(e["created_by"], "Unknown Coach")
+            e["coach_name"] = COACH_MAP_CACHE.get(e["created_by"], "Unknown Coach")
 
         return {"events": events}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 
 @router.post("")

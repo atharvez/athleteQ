@@ -1,19 +1,25 @@
-from fastapi import APIRouter, HTTPException, Depends
+import time
+import threading
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from app.schemas.schemas import AthleteUpdate
 from app.db.database import get_supabase_admin
 from app.middleware.auth import get_current_user, require_coach
 
 router = APIRouter(prefix="/athletes", tags=["athletes"])
 
-@router.get("")
-async def get_all_users(user: dict = Depends(get_current_user)):
-    """Admin only: get all athletes and coaches."""
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    db = get_supabase_admin()
+COACH_LIST_CACHE = []
+LAST_CACHE_TIME = 0
+CACHE_TTL = 300  # 5 minutes
+CACHE_LOCK = threading.Lock()
+
+def refresh_coach_list():
+    global COACH_LIST_CACHE, LAST_CACHE_TIME
+    if not CACHE_LOCK.acquire(blocking=False):
+        return
     try:
-        result = db.table("athletes").select("*").execute()
-        
+        if time.time() - LAST_CACHE_TIME < CACHE_TTL:
+            return
+        db = get_supabase_admin()
         auth_users = db.auth.admin.list_users()
         coaches = []
         for u in auth_users:
@@ -24,8 +30,32 @@ async def get_all_users(user: dict = Depends(get_current_user)):
                     "full_name": u.user_metadata.get("full_name", "Unknown Coach"),
                     "role": "coach"
                 })
-                
-        return {"athletes": result.data or [], "coaches": coaches}
+        COACH_LIST_CACHE = coaches
+        LAST_CACHE_TIME = time.time()
+    except Exception as e:
+        print("Failed to refresh coach list cache in background:", e)
+    finally:
+        CACHE_LOCK.release()
+
+
+@router.get("")
+async def get_all_users(background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """Admin only: get all athletes and coaches."""
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_supabase_admin()
+    try:
+        result = db.table("athletes").select("*").execute()
+
+        global COACH_LIST_CACHE, LAST_CACHE_TIME
+        if not COACH_LIST_CACHE:
+            # Cache is cold — do a synchronous fetch on first call
+            refresh_coach_list()
+        elif time.time() - LAST_CACHE_TIME > CACHE_TTL:
+            # Cache is stale — refresh in background, serve stale data now
+            background_tasks.add_task(refresh_coach_list)
+
+        return {"athletes": result.data or [], "coaches": COACH_LIST_CACHE}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -36,8 +66,22 @@ async def get_my_profile(user: dict = Depends(get_current_user)):
     try:
         result = db.table("athletes").select("*").eq("user_id", user["id"]).execute()
         if not result.data:
+            if user.get("role") == "athlete":
+                import uuid
+                metadata = user.get("user_metadata") or {}
+                profile_data = {
+                    "user_id": user["id"],
+                    "full_name": metadata.get("full_name") or user["email"].split("@")[0].capitalize(),
+                    "sport": metadata.get("sport") or "General",
+                    "qr_token": str(uuid.uuid4())
+                }
+                insert_res = db.table("athletes").insert(profile_data).execute()
+                if insert_res.data:
+                    return insert_res.data[0]
             raise HTTPException(status_code=404, detail="Athlete profile not found")
         return result.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -52,6 +96,8 @@ async def update_my_profile(body: AthleteUpdate, user: dict = Depends(get_curren
         if not result.data:
             raise HTTPException(status_code=404, detail="Athlete not found")
         return result.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -67,6 +113,8 @@ async def refresh_qr_token(user: dict = Depends(get_current_user)):
         if not result.data:
             raise HTTPException(status_code=404, detail="Athlete not found")
         return {"qr_token": new_token}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -127,6 +175,8 @@ async def get_athlete(athlete_id: str, user: dict = Depends(require_coach)):
         if not result.data:
             raise HTTPException(status_code=404, detail="Athlete not found")
         return result.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -135,14 +185,13 @@ async def get_athlete(athlete_id: str, user: dict = Depends(require_coach)):
 async def get_athlete_history(athlete_id: str, user: dict = Depends(get_current_user)):
     """Full test result history with stats for an athlete."""
     db = get_supabase_admin()
-
-    # Allow athletes to only see their own history
-    if user["role"] == "athlete":
-        profile = db.table("athletes").select("id").eq("user_id", user["id"]).execute()
-        if not profile.data or profile.data[0]["id"] != athlete_id:
-            raise HTTPException(status_code=403, detail="Access denied")
-
     try:
+        # Allow athletes to only see their own history
+        if user["role"] == "athlete":
+            profile = db.table("athletes").select("id").eq("user_id", user["id"]).execute()
+            if not profile.data or profile.data[0]["id"] != athlete_id:
+                raise HTTPException(status_code=403, detail="Access denied")
+
         results = db.table("test_results").select(
             "*, test_events(name, test_type)"
         ).eq("athlete_id", athlete_id).order("recorded_at", desc=True).execute()
@@ -170,6 +219,8 @@ async def get_athlete_history(athlete_id: str, user: dict = Depends(get_current_
 
         return {"athlete_id": athlete_id, "history": history}
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
